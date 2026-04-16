@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 功能：
-1. 获取更新指示书，解析主更新包 URL
-2. 检查 ORDER_TIME，未到时间则跳过下载
-3. 断点续传下载 .opt 增量文件
+1. 获取更新指示书，解析所有 patch/option 的 URL
+2. 检查每个更新包的 ORDER_TIME，未到时间则跳过下载
+3. 断点续传下载所有 .opt / .patch 文件
 4. 自动识别版本号，调用 fsdecrypt 解密并重命名输出目录
-5. 保存更新信息到 Log 目录，自动去重
+5. 保存所有更新信息到 Log 目录，自动去重
+6. 完整显示主更新包及所有历史可选更新包
 """
 
 import os
@@ -16,7 +17,7 @@ import json
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from urllib.parse import parse_qs
 import configparser
 
@@ -65,9 +66,7 @@ class NoCompressionAdapter(HTTPAdapter):
 
 # ---------- 辅助函数 ----------
 def run_fsdecrypt(opt_file: Path, version: str) -> bool:
-    """
-    调用 fsdecrypt.exe 解密 opt 文件，将其生成的同名目录重命名为版本号。
-    """
+    """调用 fsdecrypt.exe 解密 opt 文件，将其生成的同名目录重命名为版本号。"""
     if not FSDECRYPT_EXE.exists():
         logger.error("未找到 fsdecrypt.exe，请将其放在脚本同目录下")
         return False
@@ -78,12 +77,10 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
 
     logger.info(f"正在调用 fsdecrypt 解密: {opt_file.name}")
 
-    # 获取绝对路径
     exe_path = str(FSDECRYPT_EXE.resolve())
     opt_path = str(opt_file.resolve())
     opt_dir = opt_file.parent
 
-    # 在 opt 文件所在目录执行 fsdecrypt
     original_cwd = os.getcwd()
     os.chdir(opt_dir)
 
@@ -101,7 +98,6 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
         os.chdir(original_cwd)
         return False
 
-    # 实时读取并打印输出
     for line in process.stdout:
         print(line, end='')
     process.wait()
@@ -112,7 +108,6 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
         logger.error(f"fsdecrypt 执行失败，返回码 {process.returncode}")
         return False
 
-    # fsdecrypt 默认生成一个与 opt 文件同名的文件夹（不含扩展名）
     default_output_dir = opt_file.with_suffix('')
     target_dir = opt_dir / version
 
@@ -129,18 +124,25 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
         return False
 
 
-def extract_version_from_filename(filename: str) -> str:
-    """
-    从 OPT 文件名中提取版本号，如 SDGB_A071_20260408123929_0.opt -> A071
-    """
+def extract_version_from_desc(desc: str, filename: str) -> str:
+    """优先从更新描述中提取版本号，失败则从文件名提取。"""
+    match = re.search(r'_(A\d{3})$', desc)
+    if match:
+        return match.group(1)
+    match = re.search(r'PATCH_.*_(.+)$', desc)
+    if match:
+        return f"patch_{match.group(1)}"
     match = re.search(r'_(A\d{3})_', filename)
     if match:
         return match.group(1)
-    logger.warning("无法从文件名提取版本号，使用时间戳")
+    match = re.search(r'_(patch_\d+\.\d+)_', filename)
+    if match:
+        return match.group(1)
+    logger.warning(f"无法提取版本号: {filename}，使用时间戳")
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# ---------- AES 加解密（指示书）----------
+# ---------- AES 加解密 ----------
 def auth_lite_encrypt(plaintext: str) -> bytes:
     content = bytes(32) + plaintext.encode("utf-8")
     padded = pad(content, AES.block_size)
@@ -154,7 +156,7 @@ def auth_lite_decrypt(ciphertext: bytes) -> str:
     return decrypted[16:].decode("utf-8").strip()
 
 
-# ---------- 获取更新指示书 ----------
+# ---------- 获取指示书 ----------
 def get_raw_delivery(serial: str) -> str:
     encrypted = auth_lite_encrypt(f"title_id={GAME_ID}&title_ver={TITLE_VER}&client_id={serial}")
     session = requests.Session()
@@ -169,7 +171,7 @@ def get_raw_delivery(serial: str) -> str:
     return "".join(c for c in decrypted if 31 < ord(c) < 127)
 
 
-def parse_raw_delivery(delivery_str: str):
+def parse_raw_delivery(delivery_str: str) -> List[str]:
     parsed = {k: v[0] for k, v in parse_qs(delivery_str).items()}
     if parsed.get("result") != "1":
         return []
@@ -186,7 +188,7 @@ def get_update_ini(url: str) -> str:
     return resp.text
 
 
-def parse_update_ini(ini_text: str):
+def parse_update_ini(ini_text: str) -> Optional[Dict]:
     if not ini_text:
         return None
     if ini_text.startswith('\ufeff'):
@@ -213,7 +215,7 @@ def parse_update_ini(ini_text: str):
     }
 
 
-# ---------- 下载 .opt ----------
+# ---------- 下载 ----------
 def download_file_edge(url: str, save_path: Path, max_retries: int = 3) -> bool:
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
@@ -293,7 +295,6 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
             wait_hours = int((wait_seconds % 86400) // 3600)
             logger.warning(f"当前时间早于允许下载时间 {order_time_str}")
             logger.info(f"还需等待约 {wait_days} 天 {wait_hours} 小时")
-            # 即使未到时间，如果本地已有文件，也返回文件路径
             if file_path.exists():
                 logger.info(f"但本地已存在文件: {filename}")
                 return file_path
@@ -301,7 +302,6 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
                 logger.info("本地也没有文件，跳过下载")
                 return None
 
-    # 时间已到或无法解析时间
     if file_path.exists():
         logger.info(f"文件已存在，跳过下载: {filename}")
         return file_path
@@ -316,13 +316,12 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
 
 # ---------- 信息展示 ----------
 def print_update_info(info: dict):
+    """完整展示更新信息，包括主更新包和所有历史可选更新包。"""
     if not info:
         return
     print("\n" + "=" * 60)
-    print("🎮 舞萌 DX 更新信息")
+    print(f"🎮 {info.get('游戏ID', 'N/A')} - {info.get('更新描述', 'N/A')}")
     print("=" * 60)
-    print(f"游戏标识:     {info.get('游戏ID', 'N/A')}")
-    print(f"更新描述:     {info.get('更新描述', 'N/A')}")
     print(f"允许下载时间: {info.get('允许下载时间', 'N/A')}")
     print(f"实际应用时间: {info.get('实际应用时间', 'N/A')}")
     print("-" * 60)
@@ -351,94 +350,83 @@ def main():
     log_dir = script_dir / "Log"
     log_dir.mkdir(exist_ok=True)
 
-    # 1. 获取更新指示书
-    success = False
-    final_info = None
+    all_infos: List[Dict] = []
     for serial in JIANGSU_SERIALS:
         logger.info(f"尝试序列号: {serial}")
         try:
             raw = get_raw_delivery(serial)
             urls = parse_raw_delivery(raw)
             if not urls:
+                logger.warning("未解析到任何指示书 URL")
                 continue
+
             for url in urls:
                 logger.info(f"获取指示书: {url.split('/')[-1]}")
                 text = get_update_ini(url)
                 if text:
                     info = parse_update_ini(text)
                     if info and info.get("主更新包"):
-                        logger.success("解析成功")
-                        final_info = info
-                        success = True
-                        break
-            if success:
+                        all_infos.append(info)
+            if all_infos:
                 break
         except Exception as e:
             logger.error(f"序列号 {serial} 异常: {e}")
 
-    if not success or not final_info:
-        logger.error("未获取到更新信息")
+    if not all_infos:
+        logger.error("未获取到任何有效更新信息")
         return
 
-    print_update_info(final_info)
+    print("\n" + "🎊 舞萌 DX 更新信息汇总 🎊".center(60, "="))
+    for info in all_infos:
+        print_update_info(info)
 
-    main_pkg = final_info.get("主更新包")
-    if not main_pkg:
-        logger.error("更新信息中缺少主更新包")
-        return
+    processed_versions = []
+    for info in all_infos:
+        main_pkg = info.get("主更新包")
+        if not main_pkg:
+            continue
 
-    # 2. 获取 OPT 文件（处理时间检查）
-    opt_path = check_and_download_opt(main_pkg, opt_dir, final_info["允许下载时间"])
+        opt_path = check_and_download_opt(main_pkg, opt_dir, info["允许下载时间"])
+        if not opt_path or not opt_path.exists():
+            continue
 
-    if not opt_path or not opt_path.exists():
-        logger.info("没有可用的 OPT 文件，脚本结束")
-        # 仍然保存 JSON 信息（可选）
-        should_save = True
+        version = extract_version_from_desc(info["更新描述"], opt_path.name)
+        logger.info(f"版本标识: {version}")
+
+        if run_fsdecrypt(opt_path, version):
+            logger.success(f"✅ {version} 提取成功: {opt_dir / version}")
+            processed_versions.append(version)
+        else:
+            logger.error(f"❌ {version} 解密失败")
+
+    # 保存 JSON 日志
+    if processed_versions:
+        summary = {
+            "获取时间": datetime.now().isoformat(),
+            "处理的更新包": processed_versions,
+            "指示书详情": all_infos,
+        }
         existing_logs = sorted(log_dir.glob("maimai_update_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        should_save = True
         if existing_logs:
             latest_log = existing_logs[0]
             try:
                 with open(latest_log, "r", encoding="utf-8") as f:
-                    old_info = json.load(f)
-                if old_info == final_info:
+                    old = json.load(f)
+                old_files = {pkg["主更新包"]["文件名"] for pkg in old.get("指示书详情", []) if pkg.get("主更新包")}
+                new_files = {pkg["主更新包"]["文件名"] for pkg in all_infos if pkg.get("主更新包")}
+                if old_files == new_files:
+                    logger.info("更新信息未变化，跳过保存")
                     should_save = False
             except:
                 pass
         if should_save:
             json_path = log_dir / f"maimai_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(final_info, f, ensure_ascii=False, indent=2)
+                json.dump(summary, f, ensure_ascii=False, indent=2)
             logger.success(f"更新信息已保存: {json_path}")
-        return
-
-    # 3. 提取版本号并解密
-    version = extract_version_from_filename(opt_path.name)
-    logger.info(f"提取到版本号: {version}")
-
-    if run_fsdecrypt(opt_path, version):
-        logger.success(f"🎉 成功！更新文件已提取到: {opt_dir / version}")
     else:
-        logger.error("解密失败，请检查 fsdecrypt 输出")
-
-    # 4. 保存 JSON 日志（去重）
-    existing_logs = sorted(log_dir.glob("maimai_update_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    should_save = True
-    if existing_logs:
-        latest_log = existing_logs[0]
-        try:
-            with open(latest_log, "r", encoding="utf-8") as f:
-                old_info = json.load(f)
-            if old_info == final_info:
-                logger.info("更新信息未变化，跳过保存")
-                should_save = False
-        except Exception as e:
-            logger.warning(f"读取旧日志失败: {e}")
-
-    if should_save:
-        json_path = log_dir / f"maimai_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(final_info, f, ensure_ascii=False, indent=2)
-        logger.success(f"更新信息已保存: {json_path}")
+        logger.warning("没有任何更新包被成功处理")
 
 
 if __name__ == "__main__":
