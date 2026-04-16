@@ -399,35 +399,37 @@ def main():
         else:
             logger.error(f"❌ {version} 解密失败")
 
-    # 保存 JSON 日志
-    if processed_versions:
-        summary = {
-            "获取时间": datetime.now().isoformat(),
-            "处理的更新包": processed_versions,
-            "指示书详情": all_infos,
-        }
-        existing_logs = sorted(log_dir.glob("maimai_update_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        should_save = True
-        if existing_logs:
-            latest_log = existing_logs[0]
-            try:
-                with open(latest_log, "r", encoding="utf-8") as f:
-                    old = json.load(f)
-                old_files = {pkg["主更新包"]["文件名"] for pkg in old.get("指示书详情", []) if pkg.get("主更新包")}
-                new_files = {pkg["主更新包"]["文件名"] for pkg in all_infos if pkg.get("主更新包")}
-                if old_files == new_files:
-                    logger.info("更新信息未变化，跳过保存")
-                    should_save = False
-            except:
-                pass
-        if should_save:
-            json_path = log_dir / f"maimai_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(summary, f, ensure_ascii=False, indent=2)
-            logger.success(f"更新信息已保存: {json_path}")
-    else:
-        logger.warning("没有任何更新包被成功处理")
+    # ---- 始终保存 JSON 日志（只要有有效信息） ----
+    summary = {
+        "获取时间": datetime.now().isoformat(),
+        "处理的更新包": processed_versions,
+        "指示书详情": all_infos,
+    }
 
+    existing_logs = sorted(log_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    should_save = True
+    if existing_logs:
+        latest_log = existing_logs[0]
+        try:
+            with open(latest_log, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            old_infos = old.get("指示书详情", [])
+            if old_infos == all_infos:
+                logger.info("更新信息未变化，跳过保存")
+                should_save = False
+        except Exception as e:
+            logger.warning(f"读取旧日志失败，将保存新文件: {e}")
+
+    if should_save:
+        now = datetime.now()
+        filename = now.strftime("%Y-%m-%d-%Hh%Mm.json")
+        json_path = log_dir / filename
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        logger.success(f"更新信息已保存: {json_path}")
+
+    if not processed_versions:
+        logger.info("本次未处理任何更新包（可能时间未到或文件缺失）")
 
 if __name__ == "__main__":
     main()
