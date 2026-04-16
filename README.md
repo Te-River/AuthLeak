@@ -21,6 +21,6 @@ pip install uv
 # 根据pyproject.toml文件同步依赖
 uv sync
 
-# 直接运行
+# 运行
 uv run python AuthLeak.py
 ```
