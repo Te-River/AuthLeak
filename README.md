@@ -8,11 +8,13 @@ AuthLeak By Ver.CN 1.53
 首先将仓库Clone下来
 ```powershell
 # Clone仓库
-git clone https://gitclone.com/github.com/Te-River/AuthLeak.git
-
-# 
+git clone https://github.com/Te-River/AuthLeak.git
 ```
-```python
+之后就可以进行部署了
+```powershell
+# 进入Clone的目录
+cd .\AuthLeak\
+
 # 安装uv库
 pip install uv
 
