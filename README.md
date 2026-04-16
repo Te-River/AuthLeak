@@ -22,7 +22,7 @@ pip install uv
 uv sync
 
 # 运行
-uv run python AuthLeak.py
+uv run python AuthLeak.py #你也可以双击run.bat
 ```
 #### 特别鸣谢
 - **fsdecrypt项目**
