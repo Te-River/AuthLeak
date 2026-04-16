@@ -25,4 +25,4 @@ uv sync
 uv run python AuthLeak.py
 ```
 #### 特别鸣谢
-**fsdecrypt项目**
+- **fsdecrypt项目**
