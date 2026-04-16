@@ -5,13 +5,20 @@ AuthLeak By Ver.CN 1.53
 2.本项目基于**Python**语言编写，使用前请确保您的Python环境**完好无缺**</br>
 3.本项目使用**uv**这个好用的虚拟环境。</br>
 ### 部署教程
+首先将仓库Clone下来
+```powershell
+# Clone仓库
+git clone https://gitclone.com/github.com/Te-River/AuthLeak.git
+
+# 
+```
 ```python
-#安装uv库
+# 安装uv库
 pip install uv
 
-#根据pyproject.toml文件同步依赖
+# 根据pyproject.toml文件同步依赖
 uv sync
 
-#直接运行
+# 直接运行
 uv run python AuthLeak.py
 ```
