@@ -7,6 +7,7 @@ dependencies = [
     "pycryptodome>=3.20.0",
     "requests>=2.31.0",
     "loguru>=0.7.2",
+    "cryptocode>=0.1",
 ]
 
 [tool.uv]
