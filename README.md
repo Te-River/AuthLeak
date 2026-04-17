@@ -1,5 +1,5 @@
 # 用别怕，怕别用
-AuthLeak By Ver.CN 1.53
+AuthLeak By 1.53
 ## 使用须知
 1.使用本工具造成的任何法律纠纷、账号封禁、数据丢失等后果，由**使用者本人**承担，开发者不承担任何责任，**严禁用于任何商业或非法用途**。</br>
 2.本项目基于**Python**语言编写，使用前请确保您的Python环境**完好无缺**</br>
@@ -7,10 +7,10 @@ AuthLeak By Ver.CN 1.53
 ### 部署教程
 首先将仓库Clone下来
 ```powershell
-# Clone仓库
+# Clone仓库 如果访问缓慢可自行寻找相关镜像站
 git clone https://github.com/Te-River/AuthLeak.git
 ```
-之后就可以进行部署了
+之后就可以配置依赖了
 ```powershell
 # 进入Clone的目录
 cd .\AuthLeak\
@@ -21,8 +21,8 @@ pip install uv
 # 根据pyproject.toml文件同步依赖
 uv sync
 
-# 运行
-uv run python AuthLeak.py #你也可以双击run.bat
+# 运行py文件 你也可以直接运行run.bat
+uv run python AuthLeak.py
 ```
-#### 特别鸣谢
+### 特别鸣谢
 - **fsdecrypt项目**
