@@ -24,5 +24,5 @@ uv sync
 # 运行py文件 你也可以直接运行run.bat
 uv run python AuthLeak.py
 ```
-#### 特别鸣谢
+### 特别鸣谢
 - **fsdecrypt项目**
