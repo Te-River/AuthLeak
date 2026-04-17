@@ -21,7 +21,7 @@ pip install uv
 # 根据pyproject.toml文件同步依赖
 uv sync
 
-# 运行 你也可以双击run.bat
+# 运行py文件 你也可以直接运行run.bat
 uv run python AuthLeak.py
 ```
 #### 特别鸣谢
