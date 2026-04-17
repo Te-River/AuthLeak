@@ -10,7 +10,7 @@ AuthLeak By 1.53
 # Clone仓库 如果访问缓慢可自行寻找相关镜像站
 git clone https://github.com/Te-River/AuthLeak.git
 ```
-之后就可以进行部署了
+之后就可以配置依赖了
 ```powershell
 # 进入Clone的目录
 cd .\AuthLeak\
