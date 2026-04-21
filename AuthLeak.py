@@ -12,7 +12,7 @@ import time
 import json
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from urllib.parse import parse_qs
 import configparser
@@ -20,6 +20,7 @@ import configparser
 import requests
 from requests.adapters import HTTPAdapter
 from loguru import logger
+from tqdm import tqdm  # 进度条
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -29,6 +30,9 @@ import cryptocode
 # ---------- 基本配置 ----------
 TITLE_VER = "1.53"
 GAME_ID = "SDGB"
+
+# 下载限速（单位：字节/秒），可根据需要调整
+DOWNLOAD_SPEED_LIMIT = 1.5 * 1024 * 1024  # 1.5 MB/s
 
 # AES 密钥与 IV
 LITE_AUTH_KEY = bytes([47, 63, 106, 111, 43, 34, 76, 38, 92, 67, 114, 57, 40, 61, 107, 71])
@@ -234,7 +238,7 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
 
 
 def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bool:
-    """使用原生请求头下载文件，支持断点续传"""
+    """使用原生请求头下载文件，支持断点续传、限速和进度条"""
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
@@ -265,11 +269,50 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
             else:
                 resp.raise_for_status()
 
+            # 获取文件总大小（如果服务器提供）
+            total_size = None
+            if "Content-Length" in resp.headers:
+                total_size = int(resp.headers["Content-Length"])
+                if resume_pos > 0:
+                    total_size += resume_pos  # 续传时总大小是剩余部分 + 已下载部分
+
             mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
             with open(part_path, mode) as f:
-                for chunk in resp.iter_content(8192):
-                    if chunk:
-                        f.write(chunk)
+                # ---------- 进度条 + 限速 ----------
+                chunk_size = 8192
+                # 初始化进度条
+                with tqdm(
+                    total=total_size,
+                    initial=resume_pos,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=save_path.name,
+                    leave=False,
+                    miniters=1,
+                    smoothing=0.1,
+                ) as pbar:
+                    downloaded_this_second = 0
+                    second_start = time.time()
+
+                    for chunk in resp.iter_content(chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            chunk_len = len(chunk)
+                            pbar.update(chunk_len)
+                            downloaded_this_second += chunk_len
+
+                            # 限速逻辑：每秒检查一次，超过限制则等待
+                            elapsed = time.time() - second_start
+                            if elapsed < 1.0 and downloaded_this_second >= DOWNLOAD_SPEED_LIMIT:
+                                sleep_time = 1.0 - elapsed
+                                time.sleep(sleep_time)
+                                second_start = time.time()
+                                downloaded_this_second = 0
+                            elif elapsed >= 1.0:
+                                second_start = time.time()
+                                downloaded_this_second = 0
+                # ----------------------------------
 
             part_path.rename(save_path)
             logger.success(f"下载完成: {save_path.name}")
@@ -298,7 +341,7 @@ def parse_order_time(time_str: str) -> Optional[datetime]:
 
 
 def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) -> Optional[Path]:
-    """检查时间并下载主更新包"""
+    """检查时间并下载主更新包（允许提前 24 小时下载）"""
     if not main_info or not main_info.get("下载地址"):
         return None
 
@@ -309,11 +352,16 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
 
     if order_time:
         now = datetime.now()
-        if now < order_time:
-            wait_seconds = (order_time - now).total_seconds()
+        # 提前 24 小时即可下载
+        effective_time = order_time - timedelta(hours=24)
+        if now < effective_time:
+            wait_seconds = (effective_time - now).total_seconds()
             wait_days = int(wait_seconds // 86400)
             wait_hours = int((wait_seconds % 86400) // 3600)
-            logger.warning(f"当前时间早于允许下载时间 {order_time_str}")
+            logger.warning(
+                f"当前时间早于提前下载时间 {effective_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"（原定 {order_time.strftime('%Y-%m-%d %H:%M:%S')} 提前24h）"
+            )
             logger.info(f"还需等待约 {wait_days} 天 {wait_hours} 小时")
             if file_path.exists():
                 logger.info(f"但本地已存在文件: {filename}")
