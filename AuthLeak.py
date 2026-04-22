@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-游戏更新助手
+游戏更新助手 - 多架构自适应版
 用法: uv run python script.py
 功能: 获取更新信息、下载增量包、解密提取资源
+支持平台: Windows (x86_64), Linux (x86_64, ARM64)
 """
 
 import os
 import re
-import shutil
 import time
 import json
+import stat
+import platform
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -20,7 +22,7 @@ import configparser
 import requests
 from requests.adapters import HTTPAdapter
 from loguru import logger
-from tqdm import tqdm  # 进度条
+from tqdm import tqdm
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -31,8 +33,8 @@ import cryptocode
 TITLE_VER = "1.53"
 GAME_ID = "SDGB"
 
-# 下载限速（单位：字节/秒），可根据需要调整
-DOWNLOAD_SPEED_LIMIT = 1.5 * 1024 * 1024  # 1.5 MB/s
+# 下载限速（单位：字节/秒），设为 0 可关闭限速
+DOWNLOAD_SPEED_LIMIT = 10 * 1024 * 1024  # 10 MB/s
 
 # AES 密钥与 IV
 LITE_AUTH_KEY = bytes([47, 63, 106, 111, 43, 34, 76, 38, 92, 67, 114, 57, 40, 61, 107, 71])
@@ -56,8 +58,58 @@ CABINET_HEADERS = {
     "Connection": "Keep-Alive",
 }
 
-# 解密工具
-FSDECRYPT_EXE = Path("fsdecrypt.exe")
+# ---------- 平台与架构适配：解密工具 ----------
+SYSTEM = platform.system().lower()
+MACHINE = platform.machine().lower()
+
+def get_fsdecrypt_path() -> Path:
+    """根据当前操作系统和 CPU 架构返回正确的解密工具路径（优先从 fsdecrypt 子目录查找）"""
+    # 工具存放的子目录
+    tool_dir = Path("fsdecrypt")
+
+    if SYSTEM == "windows":
+        # Windows: 优先使用 fsdecrypt.exe
+        candidates = [
+            tool_dir / "fsdecrypt.exe",
+            Path("fsdecrypt.exe"),
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return Path("fsdecrypt.exe")  # 返回默认值，后续会报错
+
+    else:
+        # Linux / macOS
+        arch_map = {
+            "x86_64": "fsdecrypt_x86_64",
+            "amd64": "fsdecrypt_x86_64",
+            "aarch64": "fsdecrypt_arm64",
+            "arm64": "fsdecrypt_arm64",
+            "armv7l": "fsdecrypt_arm32",
+        }
+        filename = arch_map.get(MACHINE, "fsdecrypt")
+        candidates = [
+            tool_dir / filename,
+            Path(filename),
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+
+        logger.warning(f"未找到架构 {MACHINE} 的解密工具，尝试使用默认 fsdecrypt")
+        return Path("fsdecrypt")
+
+FSDECRYPT_EXE = get_fsdecrypt_path()
+
+# 启动时检查并赋予可执行权限（仅 Linux/macOS）
+if SYSTEM != "windows" and FSDECRYPT_EXE.exists():
+    try:
+        current_perms = FSDECRYPT_EXE.stat().st_mode
+        if not (current_perms & stat.S_IXUSR):
+            logger.info(f"为 {FSDECRYPT_EXE} 添加可执行权限")
+            FSDECRYPT_EXE.chmod(current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception as e:
+        logger.warning(f"无法修改权限: {e}")
 
 ENCRYPTED_KEY = "TNR1ip96qwkUBVg=*U0t8/L0fFrCK5Q/qYm3l7Q==*OSOEcXkWT3dFzvBMhTJiAA==*XG+KrOA43KJHEghrv0wWNA=="
 
@@ -72,7 +124,8 @@ class NoCompressionAdapter(HTTPAdapter):
 def run_fsdecrypt(opt_file: Path, version: str) -> bool:
     """调用解密工具处理 opt 文件，并将输出目录重命名为指定版本号"""
     if not FSDECRYPT_EXE.exists():
-        logger.error("未找到解密工具")
+        logger.error(f"未找到解密工具: {FSDECRYPT_EXE}")
+        logger.error(f"当前架构: {MACHINE}，请确保 fsdecrypt/ 目录下有对应文件")
         return False
     if not opt_file.exists():
         logger.error(f"文件不存在: {opt_file}")
@@ -86,7 +139,7 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
         logger.info(f"目标目录 {target_dir} 已存在，跳过解密")
         return True
 
-    logger.info(f"正在调用解密工具处理: {opt_file.name}")
+    logger.info(f"正在调用解密工具处理: {opt_file.name} (工具: {FSDECRYPT_EXE})")
 
     exe_path = str(FSDECRYPT_EXE.resolve())
     opt_path = str(opt_file.resolve())
@@ -134,7 +187,7 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
     
 
 def get_serials() -> List[str]:
-    """返回解密后的列表"""
+    """返回解密后的设备序列号列表"""
     decrypted = cryptocode.decrypt(ENCRYPTED_KEY, "AuthLeakSaltKey2026")
     if not decrypted:
         raise ValueError("解密失败")
@@ -274,13 +327,11 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
             if "Content-Length" in resp.headers:
                 total_size = int(resp.headers["Content-Length"])
                 if resume_pos > 0:
-                    total_size += resume_pos  # 续传时总大小是剩余部分 + 已下载部分
+                    total_size += resume_pos
 
             mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
             with open(part_path, mode) as f:
-                # ---------- 进度条 + 限速 ----------
                 chunk_size = 8192
-                # 初始化进度条
                 with tqdm(
                     total=total_size,
                     initial=resume_pos,
@@ -302,17 +353,17 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
                             pbar.update(chunk_len)
                             downloaded_this_second += chunk_len
 
-                            # 限速逻辑：每秒检查一次，超过限制则等待
-                            elapsed = time.time() - second_start
-                            if elapsed < 1.0 and downloaded_this_second >= DOWNLOAD_SPEED_LIMIT:
-                                sleep_time = 1.0 - elapsed
-                                time.sleep(sleep_time)
-                                second_start = time.time()
-                                downloaded_this_second = 0
-                            elif elapsed >= 1.0:
-                                second_start = time.time()
-                                downloaded_this_second = 0
-                # ----------------------------------
+                            # 限速逻辑（仅当 DOWNLOAD_SPEED_LIMIT > 0 时启用）
+                            if DOWNLOAD_SPEED_LIMIT > 0:
+                                elapsed = time.time() - second_start
+                                if elapsed < 1.0 and downloaded_this_second >= DOWNLOAD_SPEED_LIMIT:
+                                    sleep_time = 1.0 - elapsed
+                                    time.sleep(sleep_time)
+                                    second_start = time.time()
+                                    downloaded_this_second = 0
+                                elif elapsed >= 1.0:
+                                    second_start = time.time()
+                                    downloaded_this_second = 0
 
             part_path.rename(save_path)
             logger.success(f"下载完成: {save_path.name}")
