@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-游戏更新助手 - 多架构自适应版
-用法: uv run python script.py
-功能: 获取更新信息、下载增量包、解密提取资源
-支持平台: Windows (x86_64), Linux (x86_64, ARM64)
-"""
-
 import os
 import re
 import time
@@ -23,6 +15,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from loguru import logger
 from tqdm import tqdm
+from limiter import Limiter
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -64,11 +57,9 @@ MACHINE = platform.machine().lower()
 
 def get_fsdecrypt_path() -> Path:
     """根据当前操作系统和 CPU 架构返回正确的解密工具路径（优先从 fsdecrypt 子目录查找）"""
-    # 工具存放的子目录
     tool_dir = Path("fsdecrypt")
 
     if SYSTEM == "windows":
-        # Windows: 优先使用 fsdecrypt.exe
         candidates = [
             tool_dir / "fsdecrypt.exe",
             Path("fsdecrypt.exe"),
@@ -76,10 +67,8 @@ def get_fsdecrypt_path() -> Path:
         for path in candidates:
             if path.exists():
                 return path
-        return Path("fsdecrypt.exe")  # 返回默认值，后续会报错
-
+        return Path("fsdecrypt.exe")
     else:
-        # Linux / macOS
         arch_map = {
             "x86_64": "fsdecrypt_x86_64",
             "amd64": "fsdecrypt_x86_64",
@@ -291,7 +280,7 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
 
 
 def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bool:
-    """使用原生请求头下载文件，支持断点续传、限速和进度条"""
+    """使用原生请求头下载文件，支持断点续传、精确限速和进度条"""
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
@@ -332,38 +321,24 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
             mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
             with open(part_path, mode) as f:
                 chunk_size = 8192
-                with tqdm(
-                    total=total_size,
-                    initial=resume_pos,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc=save_path.name,
-                    leave=False,
-                    miniters=1,
-                    smoothing=0.1,
-                ) as pbar:
-                    downloaded_this_second = 0
-                    second_start = time.time()
+                # 初始化限速器：速率 = DOWNLOAD_SPEED_LIMIT，容量允许短暂突发
+                limiter = Limiter(rate=DOWNLOAD_SPEED_LIMIT, capacity=chunk_size * 2, consume=1) if DOWNLOAD_SPEED_LIMIT > 0 else None
+
+                with tqdm(total=total_size, initial=resume_pos,
+                          unit='B', unit_scale=True, unit_divisor=1024,
+                          desc=save_path.name, leave=False) as pbar:
 
                     for chunk in resp.iter_content(chunk_size):
                         if chunk:
-                            f.write(chunk)
-                            chunk_len = len(chunk)
-                            pbar.update(chunk_len)
-                            downloaded_this_second += chunk_len
+                            if limiter:
+                                with limiter:
+                                    f.write(chunk)
+                                    # 消耗与 chunk 大小相等的令牌，精确限速
+                                    limiter.consume(len(chunk))
+                            else:
+                                f.write(chunk)
 
-                            # 限速逻辑（仅当 DOWNLOAD_SPEED_LIMIT > 0 时启用）
-                            if DOWNLOAD_SPEED_LIMIT > 0:
-                                elapsed = time.time() - second_start
-                                if elapsed < 1.0 and downloaded_this_second >= DOWNLOAD_SPEED_LIMIT:
-                                    sleep_time = 1.0 - elapsed
-                                    time.sleep(sleep_time)
-                                    second_start = time.time()
-                                    downloaded_this_second = 0
-                                elif elapsed >= 1.0:
-                                    second_start = time.time()
-                                    downloaded_this_second = 0
+                            pbar.update(len(chunk))
 
             part_path.rename(save_path)
             logger.success(f"下载完成: {save_path.name}")
