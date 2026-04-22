@@ -15,7 +15,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from loguru import logger
 from tqdm import tqdm
-from limiter import Limiter
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -280,7 +279,10 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
 
 
 def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bool:
-    """使用原生请求头下载文件，支持断点续传、精确限速和进度条"""
+    """
+    使用原生请求头下载文件，支持断点续传、精确限速和进度条
+    限速采用“精确休眠法”：每个chunk下载后，若实际耗时小于理论耗时则主动sleep补齐
+    """
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
@@ -311,7 +313,6 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
             else:
                 resp.raise_for_status()
 
-            # 获取文件总大小（如果服务器提供）
             total_size = None
             if "Content-Length" in resp.headers:
                 total_size = int(resp.headers["Content-Length"])
@@ -321,24 +322,22 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
             mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
             with open(part_path, mode) as f:
                 chunk_size = 8192
-                # 初始化限速器：速率 = DOWNLOAD_SPEED_LIMIT，容量允许短暂突发
-                limiter = Limiter(rate=DOWNLOAD_SPEED_LIMIT, capacity=chunk_size * 2, consume=1) if DOWNLOAD_SPEED_LIMIT > 0 else None
-
                 with tqdm(total=total_size, initial=resume_pos,
                           unit='B', unit_scale=True, unit_divisor=1024,
                           desc=save_path.name, leave=False) as pbar:
 
                     for chunk in resp.iter_content(chunk_size):
                         if chunk:
-                            if limiter:
-                                with limiter:
-                                    f.write(chunk)
-                                    # 消耗与 chunk 大小相等的令牌，精确限速
-                                    limiter.consume(len(chunk))
-                            else:
-                                f.write(chunk)
-
+                            chunk_start = time.time()
+                            f.write(chunk)
                             pbar.update(len(chunk))
+
+                            # 精确限速逻辑
+                            if DOWNLOAD_SPEED_LIMIT > 0:
+                                expected_time = len(chunk) / DOWNLOAD_SPEED_LIMIT
+                                elapsed = time.time() - chunk_start
+                                if elapsed < expected_time:
+                                    time.sleep(expected_time - elapsed)
 
             part_path.rename(save_path)
             logger.success(f"下载完成: {save_path.name}")
@@ -378,7 +377,6 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
 
     if order_time:
         now = datetime.now()
-        # 提前 24 小时即可下载
         effective_time = order_time - timedelta(hours=24)
         if now < effective_time:
             wait_seconds = (effective_time - now).total_seconds()
