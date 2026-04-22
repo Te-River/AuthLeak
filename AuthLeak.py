@@ -278,7 +278,7 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
     }
 
 
-def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bool:
+def download_file_cabinet(url: str, save_path: Path, max_retries: int = 5) -> bool:
     """
     使用原生请求头下载文件，支持断点续传、精确限速和进度条
     限速采用“精确休眠法”：每个chunk下载后，若实际耗时小于理论耗时则主动sleep补齐
@@ -340,11 +340,15 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bo
                                     time.sleep(expected_time - elapsed)
 
             part_path.rename(save_path)
+            if total_size is not None and save_path.stat().st_size != total_size:
+                raise IOError(f"文件大小校验失败，预期 {total_size} 字节，实际 {save_path.stat().st_size} 字节")
             logger.success(f"下载完成: {save_path.name}")
             return True
 
         except Exception as e:
             logger.warning(f"下载失败: {e}")
+            if part_path.exists():
+                part_path.unlink(missing_ok=True)
             if attempt == max_retries:
                 logger.error("达到最大重试次数")
                 return False
