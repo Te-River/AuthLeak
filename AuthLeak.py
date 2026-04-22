@@ -5,6 +5,7 @@ import json
 import stat
 import platform
 import subprocess
+import random
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
@@ -47,7 +48,7 @@ CABINET_HEADERS = {
     "User-Agent": "SDGB;Windows/Lite",
     "Pragma": "DFI",
     "Accept-Encoding": "identity",
-    "Connection": "Keep-Alive",
+    "Connection": "keep-alive",
 }
 
 # ---------- 平台与架构适配：解密工具 ----------
@@ -278,50 +279,59 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
     }
 
 
-def download_file_cabinet(url: str, save_path: Path, max_retries: int = 5) -> bool:
+def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> bool:
     """
     使用原生请求头下载文件，支持断点续传、精确限速和进度条
-    限速采用“精确休眠法”：每个chunk下载后，若实际耗时小于理论耗时则主动sleep补齐
     """
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
 
-    resume_pos = 0
-    if part_path.exists():
-        resume_pos = part_path.stat().st_size
-        logger.info(f"续传，已下载 {resume_pos} 字节")
-
-    headers = CABINET_HEADERS.copy()
-    if resume_pos > 0:
-        headers["Range"] = f"bytes={resume_pos}-"
+    # 先获取远程文件总大小
+    total_size = None
+    try:
+        head_resp = session.head(url, headers=CABINET_HEADERS, timeout=30)
+        if "Content-Length" in head_resp.headers:
+            total_size = int(head_resp.headers["Content-Length"])
+    except Exception:
+        pass
 
     for attempt in range(1, max_retries + 1):
+        resume_pos = part_path.stat().st_size if part_path.exists() else 0
+        headers = CABINET_HEADERS.copy()
+        if resume_pos > 0:
+            headers["Range"] = f"bytes={resume_pos}-"
+
         try:
             logger.info(f"下载尝试 {attempt}/{max_retries}...")
             resp = session.get(url, headers=headers, stream=True, timeout=30)
 
+            # 处理续传逻辑
             if resume_pos > 0:
                 if resp.status_code == 206:
                     logger.info("服务器支持续传")
                 elif resp.status_code == 200:
-                    logger.warning("服务器忽略 Range，重新下载")
-                    resume_pos = 0
-                    part_path.unlink(missing_ok=True)
+                    # 服务器忽略了Range，检查是否已经完整
+                    if total_size is not None and resume_pos >= total_size:
+                        logger.info("文件已完整，直接完成")
+                        part_path.rename(save_path)
+                        return True
+                    else:
+                        logger.warning("服务器不支持续传，将从头下载")
+                        resume_pos = 0
+                        # 以 'wb' 模式重新开始，会覆盖已有内容
                 else:
                     resp.raise_for_status()
             else:
                 resp.raise_for_status()
 
-            total_size = None
-            if "Content-Length" in resp.headers:
+            # 如果没有从响应头获取到total_size，则使用之前HEAD得到的
+            if total_size is None and "Content-Length" in resp.headers:
                 total_size = int(resp.headers["Content-Length"])
-                if resume_pos > 0:
-                    total_size += resume_pos
 
-            mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
+            mode = "ab" if resume_pos > 0 else "wb"
             with open(part_path, mode) as f:
-                chunk_size = 8192
+                chunk_size = 4096
                 with tqdm(total=total_size, initial=resume_pos,
                           unit='B', unit_scale=True, unit_divisor=1024,
                           desc=save_path.name, leave=False) as pbar:
@@ -332,7 +342,6 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 5) -> bo
                             f.write(chunk)
                             pbar.update(len(chunk))
 
-                            # 精确限速逻辑
                             if DOWNLOAD_SPEED_LIMIT > 0:
                                 expected_time = len(chunk) / DOWNLOAD_SPEED_LIMIT
                                 elapsed = time.time() - chunk_start
@@ -347,12 +356,11 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 5) -> bo
 
         except Exception as e:
             logger.warning(f"下载失败: {e}")
-            if part_path.exists():
-                part_path.unlink(missing_ok=True)
+            # 如果是因为连接重置等网络错误，保留.part文件以便续传
             if attempt == max_retries:
                 logger.error("达到最大重试次数")
                 return False
-            time.sleep(2)
+            time.sleep(2 + random.uniform(0, 2))
 
     return False
 
