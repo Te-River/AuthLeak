@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-游戏更新助手 - 多架构自适应版
-用法: uv run python script.py
-功能: 获取更新信息、下载增量包、解密提取资源
-支持平台: Windows (x86_64), Linux (x86_64, ARM64)
-"""
-
 import os
 import re
 import time
@@ -13,11 +5,14 @@ import json
 import stat
 import platform
 import subprocess
+import random
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from urllib.parse import parse_qs
 import configparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,8 +28,13 @@ import cryptocode
 TITLE_VER = "1.53"
 GAME_ID = "SDGB"
 
-# 下载限速（单位：字节/秒），设为 0 可关闭限速
-DOWNLOAD_SPEED_LIMIT = 10 * 1024 * 1024  # 10 MB/s
+# 单线程下载限速 (10 MB/s)
+DOWNLOAD_SPEED_LIMIT_SINGLE = 10 * 1024 * 1024
+# 多线程下载每线程限速 (5 MB/s)
+DOWNLOAD_SPEED_LIMIT_MULTI = 5 * 1024 * 1024
+
+# 所有网络请求的统一超时时间（秒）
+REQUEST_TIMEOUT = 30
 
 # AES 密钥与 IV
 LITE_AUTH_KEY = bytes([47, 63, 106, 111, 43, 34, 76, 38, 92, 67, 114, 57, 40, 61, 107, 71])
@@ -55,7 +55,7 @@ CABINET_HEADERS = {
     "User-Agent": "SDGB;Windows/Lite",
     "Pragma": "DFI",
     "Accept-Encoding": "identity",
-    "Connection": "Keep-Alive",
+    "Connection": "keep-alive",
 }
 
 # ---------- 平台与架构适配：解密工具 ----------
@@ -64,11 +64,9 @@ MACHINE = platform.machine().lower()
 
 def get_fsdecrypt_path() -> Path:
     """根据当前操作系统和 CPU 架构返回正确的解密工具路径（优先从 fsdecrypt 子目录查找）"""
-    # 工具存放的子目录
     tool_dir = Path("fsdecrypt")
 
     if SYSTEM == "windows":
-        # Windows: 优先使用 fsdecrypt.exe
         candidates = [
             tool_dir / "fsdecrypt.exe",
             Path("fsdecrypt.exe"),
@@ -76,10 +74,8 @@ def get_fsdecrypt_path() -> Path:
         for path in candidates:
             if path.exists():
                 return path
-        return Path("fsdecrypt.exe")  # 返回默认值，后续会报错
-
+        return Path("fsdecrypt.exe")
     else:
-        # Linux / macOS
         arch_map = {
             "x86_64": "fsdecrypt_x86_64",
             "amd64": "fsdecrypt_x86_64",
@@ -237,7 +233,7 @@ def get_raw_delivery(serial: str) -> str:
         "http://at.sys-allnet.cn/net/delivery/instruction",
         data=encrypted,
         headers=DELIVERY_HEADERS,
-        timeout=30,
+        timeout=REQUEST_TIMEOUT,
     )
     decrypted = auth_lite_decrypt(resp.content)
     return "".join(c for c in decrypted if 31 < ord(c) < 127)
@@ -257,7 +253,7 @@ def get_update_ini(url: str) -> str:
     """下载指示书内容（INI格式）"""
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
-    resp = session.get(url, headers=DELIVERY_HEADERS, timeout=30)
+    resp = session.get(url, headers=DELIVERY_HEADERS, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.text
 
@@ -290,91 +286,186 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
     }
 
 
-def download_file_cabinet(url: str, save_path: Path, max_retries: int = 3) -> bool:
-    """使用原生请求头下载文件，支持断点续传、限速和进度条"""
-    part_path = save_path.with_suffix(save_path.suffix + ".part")
-    session = requests.Session()
-    session.mount("https://", NoCompressionAdapter())
-
-    resume_pos = 0
-    if part_path.exists():
-        resume_pos = part_path.stat().st_size
-        logger.info(f"续传，已下载 {resume_pos} 字节")
-
+# ---------- 辅助下载函数 ----------
+def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
+                           resume_pos: int, total_size: Optional[int],
+                           timeout_seconds: float = 6.0, speed_limit: int = DOWNLOAD_SPEED_LIMIT_SINGLE,
+                           desc: str = ""):
+    """
+    单线程下载（带独立进度条）
+    返回 (completed: bool, downloaded_bytes: int)
+    """
     headers = CABINET_HEADERS.copy()
     if resume_pos > 0:
         headers["Range"] = f"bytes={resume_pos}-"
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"下载尝试 {attempt}/{max_retries}...")
-            resp = session.get(url, headers=headers, stream=True, timeout=30)
+    try:
+        resp = session.get(url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
+        if resume_pos > 0 and resp.status_code not in (200, 206):
+            resp.raise_for_status()
+        elif resume_pos == 0:
+            resp.raise_for_status()
 
-            if resume_pos > 0:
-                if resp.status_code == 206:
-                    logger.info("服务器支持续传")
-                elif resp.status_code == 200:
-                    logger.warning("服务器忽略 Range，重新下载")
-                    resume_pos = 0
-                    part_path.unlink(missing_ok=True)
-                else:
-                    resp.raise_for_status()
-            else:
-                resp.raise_for_status()
+        mode = "ab" if resume_pos > 0 else "wb"
+        start_time = time.time()
+        bytes_downloaded = 0
 
-            # 获取文件总大小（如果服务器提供）
-            total_size = None
-            if "Content-Length" in resp.headers:
-                total_size = int(resp.headers["Content-Length"])
-                if resume_pos > 0:
-                    total_size += resume_pos
-
-            mode = "ab" if resume_pos > 0 and resp.status_code == 206 else "wb"
+        # ----- 增加单线程进度条 -----
+        with tqdm(total=total_size, initial=resume_pos,
+                  unit='B', unit_scale=True, unit_divisor=1024,
+                  desc=desc, leave=False) as pbar:
             with open(part_path, mode) as f:
-                chunk_size = 8192
-                with tqdm(
-                    total=total_size,
-                    initial=resume_pos,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc=save_path.name,
-                    leave=False,
-                    miniters=1,
-                    smoothing=0.1,
-                ) as pbar:
-                    downloaded_this_second = 0
-                    second_start = time.time()
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        f.write(chunk)
+                        chunk_len = len(chunk)
+                        bytes_downloaded += chunk_len
+                        pbar.update(chunk_len)
+                        if speed_limit > 0:
+                            time.sleep(chunk_len / speed_limit)
 
-                    for chunk in resp.iter_content(chunk_size):
+                    if time.time() - start_time > timeout_seconds:
+                        current_size = part_path.stat().st_size
+                        if total_size and current_size == total_size:
+                            return True, bytes_downloaded
+                        else:
+                            return False, bytes_downloaded
+
+        current_size = part_path.stat().st_size
+        return (total_size is not None and current_size == total_size), bytes_downloaded
+    except Exception as e:
+        logger.debug(f"单线程下载块异常: {e}")
+        return False, 0
+
+
+def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> bool:
+    """智能下载：单线程优先，若5~7秒未完成则启用3线程加速剩余部分"""
+    part_path = save_path.with_suffix(save_path.suffix + ".part")
+    session = requests.Session()
+    session.mount("https://", NoCompressionAdapter())
+
+    # 获取远程文件总大小
+    total_size = None
+    try:
+        head_resp = session.head(url, headers=CABINET_HEADERS, timeout=REQUEST_TIMEOUT)
+        if "Content-Length" in head_resp.headers:
+            total_size = int(head_resp.headers["Content-Length"])
+    except Exception:
+        pass
+
+    # 如果已存在完整文件，直接返回
+    if save_path.exists() and (total_size is None or save_path.stat().st_size == total_size):
+        logger.info(f"文件已完整存在: {save_path.name}")
+        return True
+
+    for attempt in range(1, max_retries + 1):
+        resume_pos = part_path.stat().st_size if part_path.exists() else 0
+        remaining = total_size - resume_pos if total_size else float('inf')
+        logger.info(f"下载尝试 {attempt}/{max_retries}，已下载 {resume_pos} 字节，剩余 {remaining if remaining != float('inf') else '未知'}")
+
+        # 如果本地已完整，直接完成
+        if total_size is not None and resume_pos == total_size:
+            logger.success(f"文件已完整，无需下载: {save_path.name}")
+            part_path.rename(save_path)
+            return True
+
+        try:
+            # 无法获取大小或剩余过小：直接单线程
+            if total_size is None or remaining < 10 * 1024 * 1024:
+                logger.info("采用纯单线程下载模式")
+                completed, _ = _download_single_chunk(
+                    session, url, part_path, resume_pos, total_size,
+                    timeout_seconds=float('inf'), speed_limit=DOWNLOAD_SPEED_LIMIT_SINGLE,
+                    desc=save_path.name
+                )
+                if completed:
+                    part_path.rename(save_path)
+                    logger.success(f"单线程下载完成: {save_path.name}")
+                    return True
+                raise IOError("单线程下载未完成")
+
+            # 先尝试单线程5~7秒（随机浮动）
+            timeout = random.uniform(5.0, 7.0)
+            logger.info(f"先尝试单线程下载，超时阈值 {timeout:.1f} 秒...")
+            completed, _ = _download_single_chunk(
+                session, url, part_path, resume_pos, total_size,
+                timeout_seconds=timeout, speed_limit=DOWNLOAD_SPEED_LIMIT_SINGLE,
+                desc=save_path.name
+            )
+            if completed:
+                part_path.rename(save_path)
+                logger.success(f"单线程下载完成: {save_path.name}")
+                return True
+
+            # 检查是否已经下载完整
+            current_size = part_path.stat().st_size
+            if current_size == total_size:
+                part_path.rename(save_path)
+                logger.success(f"下载完成: {save_path.name}")
+                return True
+
+            # 切换到多线程加速剩余部分
+            remaining_bytes = total_size - current_size
+            if remaining_bytes <= 0:
+                part_path.rename(save_path)
+                return True
+
+            # ----- 无感切换，仅加一条提示 -----
+            logger.info(f"📦 启用多线程加速，剩余 {remaining_bytes} 字节")
+            num_threads = 3  # 固定3线程
+            if remaining_bytes < num_threads * 4096:
+                num_threads = max(1, remaining_bytes // 4096)
+
+            # 分段
+            chunk_size_per_thread = remaining_bytes // num_threads
+            ranges = []
+            for i in range(num_threads):
+                start = current_size + i * chunk_size_per_thread
+                end = start + chunk_size_per_thread - 1 if i < num_threads - 1 else total_size - 1
+                ranges.append((start, end))
+
+            # 进度条（多线程共享）
+            lock = threading.Lock()
+            pbar = tqdm(total=total_size, initial=current_size,
+                        unit='B', unit_scale=True, unit_divisor=1024,
+                        desc=save_path.name, leave=False)
+
+            def download_segment(seg_start, seg_end):
+                seg_headers = CABINET_HEADERS.copy()
+                seg_headers["Range"] = f"bytes={seg_start}-{seg_end}"
+                resp = session.get(url, headers=seg_headers, stream=True, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                with open(part_path, "r+b") as f:
+                    f.seek(seg_start)
+                    for chunk in resp.iter_content(chunk_size=4096):
                         if chunk:
                             f.write(chunk)
-                            chunk_len = len(chunk)
-                            pbar.update(chunk_len)
-                            downloaded_this_second += chunk_len
+                            with lock:
+                                pbar.update(len(chunk))
+                            if DOWNLOAD_SPEED_LIMIT_MULTI > 0:
+                                time.sleep(len(chunk) / DOWNLOAD_SPEED_LIMIT_MULTI)
 
-                            # 限速逻辑（仅当 DOWNLOAD_SPEED_LIMIT > 0 时启用）
-                            if DOWNLOAD_SPEED_LIMIT > 0:
-                                elapsed = time.time() - second_start
-                                if elapsed < 1.0 and downloaded_this_second >= DOWNLOAD_SPEED_LIMIT:
-                                    sleep_time = 1.0 - elapsed
-                                    time.sleep(sleep_time)
-                                    second_start = time.time()
-                                    downloaded_this_second = 0
-                                elif elapsed >= 1.0:
-                                    second_start = time.time()
-                                    downloaded_this_second = 0
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(download_segment, s, e) for s, e in ranges]
+                for future in as_completed(futures):
+                    future.result()
+            pbar.close()
+
+            # 校验完整性
+            if part_path.stat().st_size != total_size:
+                raise IOError(f"多线程下载后文件大小不匹配，预期 {total_size}，实际 {part_path.stat().st_size}")
 
             part_path.rename(save_path)
-            logger.success(f"下载完成: {save_path.name}")
+            logger.success(f"多线程下载完成: {save_path.name}")
             return True
 
         except Exception as e:
             logger.warning(f"下载失败: {e}")
+            # 保留 .part 以备下次续传
             if attempt == max_retries:
                 logger.error("达到最大重试次数")
                 return False
-            time.sleep(2)
+            time.sleep(2 + random.uniform(0, 2))
 
     return False
 
@@ -403,7 +494,6 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
 
     if order_time:
         now = datetime.now()
-        # 提前 24 小时即可下载
         effective_time = order_time - timedelta(hours=24)
         if now < effective_time:
             wait_seconds = (effective_time - now).total_seconds()
