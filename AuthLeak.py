@@ -6,7 +6,10 @@ import stat
 import platform
 import subprocess
 import random
+<<<<<<< HEAD
 import threading
+=======
+>>>>>>> a37435c29ea610a8ed07f72997056161d3d28bbd
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
@@ -286,6 +289,7 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
     }
 
 
+<<<<<<< HEAD
 # ---------- 辅助下载函数 ----------
 def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
                            resume_pos: int, total_size: Optional[int],
@@ -323,6 +327,64 @@ def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
                         pbar.update(chunk_len)
                         if speed_limit > 0:
                             time.sleep(chunk_len / speed_limit)
+=======
+def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> bool:
+    """
+    使用原生请求头下载文件，支持断点续传、精确限速和进度条
+    """
+    part_path = save_path.with_suffix(save_path.suffix + ".part")
+    session = requests.Session()
+    session.mount("https://", NoCompressionAdapter())
+
+    # 先获取远程文件总大小
+    total_size = None
+    try:
+        head_resp = session.head(url, headers=CABINET_HEADERS, timeout=30)
+        if "Content-Length" in head_resp.headers:
+            total_size = int(head_resp.headers["Content-Length"])
+    except Exception:
+        pass
+
+    for attempt in range(1, max_retries + 1):
+        resume_pos = part_path.stat().st_size if part_path.exists() else 0
+        headers = CABINET_HEADERS.copy()
+        if resume_pos > 0:
+            headers["Range"] = f"bytes={resume_pos}-"
+
+        try:
+            logger.info(f"下载尝试 {attempt}/{max_retries}...")
+            resp = session.get(url, headers=headers, stream=True, timeout=30)
+
+            # 处理续传逻辑
+            if resume_pos > 0:
+                if resp.status_code == 206:
+                    logger.info("服务器支持续传")
+                elif resp.status_code == 200:
+                    # 服务器忽略了Range，检查是否已经完整
+                    if total_size is not None and resume_pos >= total_size:
+                        logger.info("文件已完整，直接完成")
+                        part_path.rename(save_path)
+                        return True
+                    else:
+                        logger.warning("服务器不支持续传，将从头下载")
+                        resume_pos = 0
+                        # 以 'wb' 模式重新开始，会覆盖已有内容
+                else:
+                    resp.raise_for_status()
+            else:
+                resp.raise_for_status()
+
+            # 如果没有从响应头获取到total_size，则使用之前HEAD得到的
+            if total_size is None and "Content-Length" in resp.headers:
+                total_size = int(resp.headers["Content-Length"])
+
+            mode = "ab" if resume_pos > 0 else "wb"
+            with open(part_path, mode) as f:
+                chunk_size = 4096
+                with tqdm(total=total_size, initial=resume_pos,
+                          unit='B', unit_scale=True, unit_divisor=1024,
+                          desc=save_path.name, leave=False) as pbar:
+>>>>>>> a37435c29ea610a8ed07f72997056161d3d28bbd
 
                     if time.time() - start_time > timeout_seconds:
                         current_size = part_path.stat().st_size
@@ -439,7 +501,9 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> b
                     f.seek(seg_start)
                     for chunk in resp.iter_content(chunk_size=4096):
                         if chunk:
+                            chunk_start = time.time()
                             f.write(chunk)
+<<<<<<< HEAD
                             with lock:
                                 pbar.update(len(chunk))
                             if DOWNLOAD_SPEED_LIMIT_MULTI > 0:
@@ -457,11 +521,29 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> b
 
             part_path.rename(save_path)
             logger.success(f"多线程下载完成: {save_path.name}")
+=======
+                            pbar.update(len(chunk))
+
+                            if DOWNLOAD_SPEED_LIMIT > 0:
+                                expected_time = len(chunk) / DOWNLOAD_SPEED_LIMIT
+                                elapsed = time.time() - chunk_start
+                                if elapsed < expected_time:
+                                    time.sleep(expected_time - elapsed)
+
+            part_path.rename(save_path)
+            if total_size is not None and save_path.stat().st_size != total_size:
+                raise IOError(f"文件大小校验失败，预期 {total_size} 字节，实际 {save_path.stat().st_size} 字节")
+            logger.success(f"下载完成: {save_path.name}")
+>>>>>>> a37435c29ea610a8ed07f72997056161d3d28bbd
             return True
 
         except Exception as e:
             logger.warning(f"下载失败: {e}")
+<<<<<<< HEAD
             # 保留 .part 以备下次续传
+=======
+            # 如果是因为连接重置等网络错误，保留.part文件以便续传
+>>>>>>> a37435c29ea610a8ed07f72997056161d3d28bbd
             if attempt == max_retries:
                 logger.error("达到最大重试次数")
                 return False
