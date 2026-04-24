@@ -7,12 +7,12 @@ import platform
 import subprocess
 import random
 import threading
+from queue import Queue
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from urllib.parse import parse_qs
 import configparser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,8 +33,14 @@ DOWNLOAD_SPEED_LIMIT_SINGLE = 10 * 1024 * 1024
 # 多线程下载每线程限速 (5 MB/s)
 DOWNLOAD_SPEED_LIMIT_MULTI = 5 * 1024 * 1024
 
-# 所有网络请求的统一超时时间（秒）
+# 所有网络请求的超时时间（秒）
 REQUEST_TIMEOUT = 30
+
+# 多线程分块大小（字节）
+CHUNK_BLOCK_SIZE = 1 * 1024 * 1024  # 1 MB
+
+# CDN拦截错误连续触发阈值
+MAX_CONSECUTIVE_567 = 3
 
 # AES 密钥与 IV
 LITE_AUTH_KEY = bytes([47, 63, 106, 111, 43, 34, 76, 38, 92, 67, 114, 57, 40, 61, 107, 71])
@@ -130,7 +136,6 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
     opt_dir = opt_file.parent
     target_dir = opt_dir / version
 
-    # 如果目标目录已存在，直接跳过解密
     if target_dir.exists() and target_dir.is_dir():
         logger.info(f"目标目录 {target_dir} 已存在，跳过解密")
         return True
@@ -180,7 +185,7 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
     else:
         logger.error("解密工具未生成预期的输出目录")
         return False
-    
+
 
 def get_serials() -> List[str]:
     """返回解密后的设备序列号列表"""
@@ -287,20 +292,26 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
 
 
 # ---------- 辅助下载函数 ----------
+def _create_567_error(resp):
+    """构造一个带有 response 属性的 HTTPError，用于传播 567 错误"""
+    err = requests.exceptions.HTTPError("CDN node timeout (567)")
+    err.response = resp
+    return err
+
+
 def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
                            resume_pos: int, total_size: Optional[int],
                            timeout_seconds: float = 6.0, speed_limit: int = DOWNLOAD_SPEED_LIMIT_SINGLE,
                            desc: str = ""):
-    """
-    单线程下载（带独立进度条）
-    返回 (completed: bool, downloaded_bytes: int)
-    """
+    """单线程下载，带独立进度条。567 错误会直接抛出 HTTPError"""
     headers = CABINET_HEADERS.copy()
     if resume_pos > 0:
         headers["Range"] = f"bytes={resume_pos}-"
 
     try:
         resp = session.get(url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 567:
+            raise _create_567_error(resp)
         if resume_pos > 0 and resp.status_code not in (200, 206):
             resp.raise_for_status()
         elif resume_pos == 0:
@@ -310,7 +321,6 @@ def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
         start_time = time.time()
         bytes_downloaded = 0
 
-        # ----- 增加单线程进度条 -----
         with tqdm(total=total_size, initial=resume_pos,
                   unit='B', unit_scale=True, unit_divisor=1024,
                   desc=desc, leave=False) as pbar:
@@ -333,44 +343,135 @@ def _download_single_chunk(session: requests.Session, url: str, part_path: Path,
 
         current_size = part_path.stat().st_size
         return (total_size is not None and current_size == total_size), bytes_downloaded
+
+    except requests.exceptions.HTTPError:
+        raise
     except Exception as e:
         logger.debug(f"单线程下载块异常: {e}")
         return False, 0
 
 
+def _download_multi_segments(session: requests.Session, url: str, part_path: Path,
+                             start_offset: int, total_size: int, desc: str):
+    """多线程分块下载剩余部分，支持动态增加线程数"""
+    remaining = total_size - start_offset
+    if remaining <= 0:
+        return
+
+    blocks = []
+    pos = start_offset
+    while pos < total_size:
+        end = min(pos + CHUNK_BLOCK_SIZE - 1, total_size - 1)
+        blocks.append((pos, end))
+        pos = end + 1
+
+    logger.info(f"剩余 {remaining} 字节，分为 {len(blocks)} 块，启用多线程")
+    initial_threads = 3
+    extra_threads = 2
+
+    queue = Queue()
+    for blk in blocks:
+        queue.put(blk)
+
+    lock = threading.Lock()
+    pbar = tqdm(total=total_size, initial=start_offset,
+                unit='B', unit_scale=True, unit_divisor=1024,
+                desc=desc, leave=False)
+
+    def worker():
+        while not queue.empty():
+            blk_start, blk_end = queue.get()
+            if blk_start > blk_end:
+                queue.task_done()
+                continue
+            headers = CABINET_HEADERS.copy()
+            headers["Range"] = f"bytes={blk_start}-{blk_end}"
+            try:
+                resp = session.get(url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 567:
+                    raise _create_567_error(resp)
+                resp.raise_for_status()
+                with open(part_path, "r+b") as f:
+                    f.seek(blk_start)
+                    for chunk in resp.iter_content(chunk_size=4096):
+                        if chunk:
+                            f.write(chunk)
+                            with lock:
+                                pbar.update(len(chunk))
+                            if DOWNLOAD_SPEED_LIMIT_MULTI > 0:
+                                time.sleep(len(chunk) / DOWNLOAD_SPEED_LIMIT_MULTI)
+            except Exception as e:
+                logger.debug(f"块 {blk_start}-{blk_end} 下载失败: {e}")
+                queue.put((blk_start, blk_end))
+            finally:
+                queue.task_done()
+
+    threads = []
+    for _ in range(initial_threads):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        threads.append(t)
+
+    time.sleep(random.uniform(5.0, 7.0))
+    if not queue.empty():
+        logger.info("📦 下载仍在进行，追加线程加速")
+        for _ in range(extra_threads):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    pbar.close()
+    if part_path.stat().st_size != total_size:
+        raise IOError(f"多线程下载后文件大小不匹配，预期 {total_size}，实际 {part_path.stat().st_size}")
+
+
 def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> bool:
-    """智能下载：单线程优先，若5~7秒未完成则启用3线程加速剩余部分"""
+    """智能下载：单线程优先，若5~7秒未完成则启用3线程，再5~7秒未完成增至5线程"""
     part_path = save_path.with_suffix(save_path.suffix + ".part")
     session = requests.Session()
     session.mount("https://", NoCompressionAdapter())
 
-    # 获取远程文件总大小
     total_size = None
+    consecutive_567 = 0
+
     try:
         head_resp = session.head(url, headers=CABINET_HEADERS, timeout=REQUEST_TIMEOUT)
-        if "Content-Length" in head_resp.headers:
+        if head_resp.status_code == 567:
+            logger.warning("HEAD请求收到567错误，将忽略文件大小检查")
+            consecutive_567 += 1
+        elif "Content-Length" in head_resp.headers:
             total_size = int(head_resp.headers["Content-Length"])
     except Exception:
         pass
 
-    # 如果已存在完整文件，直接返回
     if save_path.exists() and (total_size is None or save_path.stat().st_size == total_size):
         logger.info(f"文件已完整存在: {save_path.name}")
         return True
 
     for attempt in range(1, max_retries + 1):
+        if consecutive_567 >= MAX_CONSECUTIVE_567:
+            logger.error("连续收到CDN拦截，建议更换IP或稍后重试")
+            return False
+
         resume_pos = part_path.stat().st_size if part_path.exists() else 0
+
+        if total_size is not None and resume_pos > total_size:
+            logger.warning(f"本地文件({resume_pos}字节)大于远程文件({total_size}字节)，重置下载")
+            part_path.unlink(missing_ok=True)
+            resume_pos = 0
+
         remaining = total_size - resume_pos if total_size else float('inf')
         logger.info(f"下载尝试 {attempt}/{max_retries}，已下载 {resume_pos} 字节，剩余 {remaining if remaining != float('inf') else '未知'}")
 
-        # 如果本地已完整，直接完成
         if total_size is not None and resume_pos == total_size:
             logger.success(f"文件已完整，无需下载: {save_path.name}")
             part_path.rename(save_path)
             return True
 
         try:
-            # 无法获取大小或剩余过小：直接单线程
             if total_size is None or remaining < 10 * 1024 * 1024:
                 logger.info("采用纯单线程下载模式")
                 completed, _ = _download_single_chunk(
@@ -382,9 +483,8 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> b
                     part_path.rename(save_path)
                     logger.success(f"单线程下载完成: {save_path.name}")
                     return True
-                raise IOError("单线程下载未完成")
+                continue
 
-            # 先尝试单线程5~7秒（随机浮动）
             timeout = random.uniform(5.0, 7.0)
             logger.info(f"先尝试单线程下载，超时阈值 {timeout:.1f} 秒...")
             completed, _ = _download_single_chunk(
@@ -397,76 +497,40 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> b
                 logger.success(f"单线程下载完成: {save_path.name}")
                 return True
 
-            # 检查是否已经下载完整
             current_size = part_path.stat().st_size
             if current_size == total_size:
                 part_path.rename(save_path)
                 logger.success(f"下载完成: {save_path.name}")
                 return True
 
-            # 切换到多线程加速剩余部分
-            remaining_bytes = total_size - current_size
-            if remaining_bytes <= 0:
-                part_path.rename(save_path)
-                return True
-
-            # ----- 无感切换，仅加一条提示 -----
-            logger.info(f"📦 启用多线程加速，剩余 {remaining_bytes} 字节")
-            num_threads = 3  # 固定3线程
-            if remaining_bytes < num_threads * 4096:
-                num_threads = max(1, remaining_bytes // 4096)
-
-            # 分段
-            chunk_size_per_thread = remaining_bytes // num_threads
-            ranges = []
-            for i in range(num_threads):
-                start = current_size + i * chunk_size_per_thread
-                end = start + chunk_size_per_thread - 1 if i < num_threads - 1 else total_size - 1
-                ranges.append((start, end))
-
-            # 进度条（多线程共享）
-            lock = threading.Lock()
-            pbar = tqdm(total=total_size, initial=current_size,
-                        unit='B', unit_scale=True, unit_divisor=1024,
-                        desc=save_path.name, leave=False)
-
-            def download_segment(seg_start, seg_end):
-                seg_headers = CABINET_HEADERS.copy()
-                seg_headers["Range"] = f"bytes={seg_start}-{seg_end}"
-                resp = session.get(url, headers=seg_headers, stream=True, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                with open(part_path, "r+b") as f:
-                    f.seek(seg_start)
-                    for chunk in resp.iter_content(chunk_size=4096):
-                        if chunk:
-                            f.write(chunk)
-                            with lock:
-                                pbar.update(len(chunk))
-                            if DOWNLOAD_SPEED_LIMIT_MULTI > 0:
-                                time.sleep(len(chunk) / DOWNLOAD_SPEED_LIMIT_MULTI)
-
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = [executor.submit(download_segment, s, e) for s, e in ranges]
-                for future in as_completed(futures):
-                    future.result()
-            pbar.close()
-
-            # 校验完整性
-            if part_path.stat().st_size != total_size:
-                raise IOError(f"多线程下载后文件大小不匹配，预期 {total_size}，实际 {part_path.stat().st_size}")
-
+            _download_multi_segments(session, url, part_path, current_size, total_size, save_path.name)
             part_path.rename(save_path)
-            logger.success(f"多线程下载完成: {save_path.name}")
+            logger.success(f"下载完成: {save_path.name}")
             return True
 
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response else None
+            if status_code == 567:
+                consecutive_567 += 1
+                logger.warning(f"CDN节点响应超时 (567)，已连续出现 {consecutive_567} 次")
+                if consecutive_567 >= MAX_CONSECUTIVE_567:
+                    logger.error("连续收到CDN拦截，建议更换IP或稍后重试")
+                    return False
+            elif status_code == 416:
+                logger.warning("Range请求不满足 (416)，重置下载")
+                part_path.unlink(missing_ok=True)
+                resume_pos = 0
+                consecutive_567 = 0
+            else:
+                logger.warning(f"HTTP错误 {status_code}: {e}")
+                consecutive_567 = 0
         except Exception as e:
             logger.warning(f"下载失败: {e}")
-            # 保留 .part 以备下次续传
-            if attempt == max_retries:
-                logger.error("达到最大重试次数")
-                return False
-            time.sleep(2 + random.uniform(0, 2))
+            consecutive_567 = 0
 
+        time.sleep(2 + random.uniform(0, 2))
+
+    logger.error("达到最大重试次数")
     return False
 
 
@@ -519,7 +583,7 @@ def check_and_download_opt(main_info: dict, opt_dir: Path, order_time_str: str) 
     if download_file_cabinet(url, file_path):
         return file_path
     else:
-        logger.error("下载失败")
+        logger.error("下载失败，可能是CDN拦截或网络问题")
         return None
 
 
