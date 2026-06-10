@@ -16,7 +16,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import cryptocode
 
-TITLE_VER = "1.53"
+TITLE_VER = "1.50"
 GAME_ID = "SDGB"
 DOWNLOAD_SPEED_LIMIT_SINGLE = 10 * 1024 * 1024
 DOWNLOAD_SPEED_LIMIT_MULTI = 5 * 1024 * 1024
@@ -453,28 +453,63 @@ def main():
             if all_infos: break
         except Exception as e:
             logger.error(f"请求异常: {e}")
+    
+    # ========== 核心改动开始 ==========
     if not all_infos:
-        logger.error("未获取到任何有效更新信息")
-        return
-    print("\n" + "更新信息汇总".center(60,"="))
-    for info in all_infos: print_update_info(info)
-    processed_versions = []
-    for info in all_infos:
-        main_pkg = info.get("主更新包")
-        if not main_pkg: continue
-        opt_path = check_and_download_opt(main_pkg, opt_dir, info["允许下载时间"])
-        if not opt_path or not opt_path.exists(): continue
-        version = extract_version_from_desc(info["更新描述"], opt_path.name)
+        logger.warning("未获取到任何有效更新信息，尝试解密本地最新更新包")
+        # 查找 Opt 文件夹下所有 .app 文件，按修改时间降序取最新
+        app_files = sorted(
+            opt_dir.glob("*.app"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        if not app_files:
+            logger.error("Opt 文件夹中没有 .app 文件，无法进行离线解密")
+            return
+        latest_app = app_files[0]
+        logger.info(f"找到本地最新更新包: {latest_app.name}")
+        # 提取版本标识（desc 传空，让函数根据文件名匹配）
+        version = extract_version_from_desc("", latest_app.name)
         logger.info(f"版本标识: {version}")
-        if run_fsdecrypt(opt_path, version):
+        # 构造一个虚拟的更新信息，用于 summary 记录
+        dummy_info = {
+            "游戏ID": GAME_ID,
+            "更新描述": f"离线解密 - {latest_app.name}",
+            "允许下载时间": "",
+            "实际应用时间": "",
+            "主更新包": {"文件名": latest_app.name, "下载地址": ""},
+            "历史可选更新包": [],
+        }
+        all_infos.append(dummy_info)  # 后续的 summary 可正常记录
+        if run_fsdecrypt(latest_app, version):
             target_dir = opt_dir / version
-            if target_dir.exists():
-                logger.success(f"✅ {version} 可用: {target_dir}")
-            else:
-                logger.success(f"✅ {version} 提取成功: {target_dir}")
+            logger.success(f"✅ 离线解密成功: {target_dir}")
             processed_versions.append(version)
         else:
-            logger.error(f"❌ {version} 解密失败")
+            logger.error(f"❌ 离线解密失败: {latest_app.name}")
+        # 不再直接 return，继续执行到后面的 summary 保存逻辑
+    # ========== 核心改动结束 ==========
+    else:
+        print("\n" + "更新信息汇总".center(60,"="))
+        for info in all_infos: print_update_info(info)
+        processed_versions = []
+        for info in all_infos:
+            main_pkg = info.get("主更新包")
+            if not main_pkg: continue
+            opt_path = check_and_download_opt(main_pkg, opt_dir, info["允许下载时间"])
+            if not opt_path or not opt_path.exists(): continue
+            version = extract_version_from_desc(info["更新描述"], opt_path.name)
+            logger.info(f"版本标识: {version}")
+            if run_fsdecrypt(opt_path, version):
+                target_dir = opt_dir / version
+                if target_dir.exists():
+                    logger.success(f"✅ {version} 可用: {target_dir}")
+                else:
+                    logger.success(f"✅ {version} 提取成功: {target_dir}")
+                processed_versions.append(version)
+            else:
+                logger.error(f"❌ {version} 解密失败")
+    
     summary = {
         "获取时间": datetime.now().isoformat(),
         "处理的更新包": processed_versions,
