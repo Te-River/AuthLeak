@@ -16,7 +16,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import cryptocode
 
-TITLE_VER = "1.50"
+TITLE_VER = "1.55"
 GAME_ID = "SDGB"
 DOWNLOAD_SPEED_LIMIT_SINGLE = 10 * 1024 * 1024
 DOWNLOAD_SPEED_LIMIT_MULTI = 5 * 1024 * 1024
