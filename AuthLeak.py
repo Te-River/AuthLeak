@@ -16,7 +16,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import cryptocode
 
-TITLE_VER = "1.55"
+TITLE_VER = "1.56"
 GAME_ID = "SDGB"
 DOWNLOAD_SPEED_LIMIT_SINGLE = 10 * 1024 * 1024
 DOWNLOAD_SPEED_LIMIT_MULTI = 5 * 1024 * 1024
@@ -103,6 +103,8 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
     if process.returncode != 0:
         logger.error(f"解密工具执行失败，返回码 {process.returncode}")
         return False
+
+    # 尝试 1：工具生成了目录（去掉扩展名的目录）
     default_output_dir = opt_file.with_suffix('')
     if default_output_dir.exists() and default_output_dir.is_dir():
         logger.info(f"解密工具生成目录: {default_output_dir}")
@@ -112,9 +114,18 @@ def run_fsdecrypt(opt_file: Path, version: str) -> bool:
         default_output_dir.rename(target_dir)
         logger.success(f"已重命名为: {target_dir}")
         return True
-    else:
-        logger.error("解密工具未生成预期的输出目录")
-        return False
+
+    # 尝试 2：工具可能生成了 .vhd 文件（常见于 .app 更新包）
+    vhd_output = opt_file.with_suffix('.vhd')
+    if vhd_output.exists():
+        logger.info(f"解密工具生成了 VHD 文件: {vhd_output.name}")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        vhd_output.rename(target_dir / vhd_output.name)
+        logger.success(f"已移动 VHD 到: {target_dir / vhd_output.name}")
+        return True
+
+    logger.error("解密工具未生成预期的输出目录或 VHD 文件")
+    return False
 
 def get_serials() -> List[str]:
     decrypted = cryptocode.decrypt(ENCRYPTED_KEY, "AuthLeakSaltKey2026")
@@ -123,6 +134,17 @@ def get_serials() -> List[str]:
     return [decrypted]
 
 def extract_version_from_desc(desc: str, filename: str) -> str:
+    # 优先从文件名提取版本信息，生成类似 SDGB_1.56.00_20260520_1.55.01 的目录名
+    base = Path(filename).stem
+    m = re.match(r'^(\w+)_(\d+\.\d+\.\d+)_(\d{8})\d{6}_\d+_(.+)$', base)
+    if m:
+        game_id = m.group(1)
+        main_ver = m.group(2)          # 保留完整版本，如 1.56.00
+        date_str = m.group(3)          # 8位日期 20260520
+        target_ver = m.group(4)        # 目标版本 1.55.01
+        return f"{game_id}_{main_ver}_{date_str}_{target_ver}"
+
+    # 原有 opt 匹配规则
     match = re.search(r'_(A\d{3})$', desc)
     if match: return match.group(1)
     match = re.search(r'PATCH_.*_(.+)$', desc)
@@ -185,11 +207,13 @@ def parse_update_ini(ini_text: str) -> Optional[Dict]:
         for key, url in config.items("OPTIONAL"):
             if key.startswith("install") and url:
                 optional_files.append({"文件名": url.split('/')[-1], "下载地址": url})
+    part_size_raw = common.get("PART_SIZE", "")
     return {
         "游戏ID": common.get("GAME_ID", ""),
         "更新描述": common.get("GAME_DESC", "").strip('"'),
         "允许下载时间": common.get("ORDER_TIME", ""),
         "实际应用时间": common.get("RELEASE_TIME", ""),
+        "机台接收速度(PART_SIZE)": part_size_raw,
         "主更新包": {"文件名": main_filename, "下载地址": main_url} if main_url else None,
         "历史可选更新包": optional_files,
     }
@@ -294,14 +318,40 @@ def download_file_cabinet(url: str, save_path: Path, max_retries: int = 20) -> b
     session.mount("https://", NoCompressionAdapter())
     total_size = None
     consecutive_567 = 0
+    # 第一优先级：HEAD 请求获取 Content-Length
     try:
         head_resp = session.head(url, headers=CABINET_HEADERS, timeout=REQUEST_TIMEOUT)
         if head_resp.status_code == 567:
             logger.warning("HEAD请求收到567错误，将忽略文件大小检查")
             consecutive_567 += 1
-        elif "Content-Length" in head_resp.headers:
+        elif head_resp.status_code == 200 and "Content-Length" in head_resp.headers:
             total_size = int(head_resp.headers["Content-Length"])
     except Exception: pass
+    # 第二优先级：HEAD 失败时回退到 GET + Range: bytes=0-0 探测
+    if total_size is None and consecutive_567 < MAX_CONSECUTIVE_567:
+        try:
+            probe_headers = CABINET_HEADERS.copy()
+            probe_headers["Range"] = "bytes=0-0"
+            probe_resp = session.get(url, headers=probe_headers, stream=True, timeout=REQUEST_TIMEOUT)
+            if probe_resp.status_code == 567:
+                consecutive_567 += 1
+                logger.warning("Range探测收到567错误")
+            elif probe_resp.status_code == 206:
+                # 服务器支持 Range，从 Content-Range: bytes 0-0/TOTAL 提取总大小
+                content_range = probe_resp.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    total_size = int(content_range.split("/")[-1])
+                    logger.info(f"通过 Range 探测获取文件大小: {total_size} 字节")
+            elif probe_resp.status_code == 200 and "Content-Length" in probe_resp.headers:
+                # 服务器忽略 Range 返回完整响应
+                total_size = int(probe_resp.headers["Content-Length"])
+                logger.info(f"通过 GET Content-Length 获取文件大小: {total_size} 字节")
+            probe_resp.close()
+        except Exception as e:
+            logger.debug(f"Range探测失败: {e}")
+    if total_size is None and consecutive_567 < MAX_CONSECUTIVE_567:
+        logger.error("无法获取文件大小（HEAD 和 Range 探测均失败），下载终止")
+        return False
     if save_path.exists() and (total_size is None or save_path.stat().st_size == total_size):
         logger.info(f"文件已完整存在: {save_path.name}")
         return True
@@ -413,6 +463,28 @@ def print_update_info(info: dict):
     print("="*60)
     print(f"允许下载时间: {info.get('允许下载时间','N/A')}")
     print(f"实际应用时间: {info.get('实际应用时间','N/A')}")
+    print(f"指示书链接: {info.get('指示书链接', 'N/A')}")
+
+    # 显示机台接收速度
+    raw_speed = info.get("机台接收速度(PART_SIZE)", "")
+    if raw_speed:
+        parts = [p.strip() for p in raw_speed.split(",")]
+        speed_byte = 0
+        if len(parts) >= 2:
+            try: speed_byte = int(parts[1])
+            except: pass
+        elif len(parts) == 1:
+            try: speed_byte = int(parts[0])
+            except: pass
+        if speed_byte > 0:
+            if speed_byte >= 1024 * 1024:
+                speed_str = f"{speed_byte / (1024*1024):.1f} MB/s"
+            else:
+                speed_str = f"{speed_byte / 1024:.1f} KB/s"
+            print(f"机台接收限速: {speed_str} (PART_SIZE: {raw_speed})")
+        else:
+            print(f"机台接收速度(PART_SIZE): {raw_speed}")
+
     print("-"*60)
     main = info.get('主更新包')
     if main and main.get('下载地址'):
@@ -449,67 +521,33 @@ def main():
                 if text:
                     info = parse_update_ini(text)
                     if info and info.get("主更新包"):
+                        info["指示书链接"] = url
                         all_infos.append(info)
             if all_infos: break
         except Exception as e:
             logger.error(f"请求异常: {e}")
-    
-    # ========== 核心改动开始 ==========
     if not all_infos:
-        logger.warning("未获取到任何有效更新信息，尝试解密本地最新更新包")
-        # 查找 Opt 文件夹下所有 .app 文件，按修改时间降序取最新
-        app_files = sorted(
-            opt_dir.glob("*.app"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True
-        )
-        if not app_files:
-            logger.error("Opt 文件夹中没有 .app 文件，无法进行离线解密")
-            return
-        latest_app = app_files[0]
-        logger.info(f"找到本地最新更新包: {latest_app.name}")
-        # 提取版本标识（desc 传空，让函数根据文件名匹配）
-        version = extract_version_from_desc("", latest_app.name)
+        logger.error("未获取到任何有效更新信息")
+        return
+    print("\n" + "更新信息汇总".center(60,"="))
+    for info in all_infos: print_update_info(info)
+    processed_versions = []
+    for info in all_infos:
+        main_pkg = info.get("主更新包")
+        if not main_pkg: continue
+        opt_path = check_and_download_opt(main_pkg, opt_dir, info["允许下载时间"])
+        if not opt_path or not opt_path.exists(): continue
+        version = extract_version_from_desc(info["更新描述"], opt_path.name)
         logger.info(f"版本标识: {version}")
-        # 构造一个虚拟的更新信息，用于 summary 记录
-        dummy_info = {
-            "游戏ID": GAME_ID,
-            "更新描述": f"离线解密 - {latest_app.name}",
-            "允许下载时间": "",
-            "实际应用时间": "",
-            "主更新包": {"文件名": latest_app.name, "下载地址": ""},
-            "历史可选更新包": [],
-        }
-        all_infos.append(dummy_info)  # 后续的 summary 可正常记录
-        if run_fsdecrypt(latest_app, version):
+        if run_fsdecrypt(opt_path, version):
             target_dir = opt_dir / version
-            logger.success(f"✅ 离线解密成功: {target_dir}")
+            if target_dir.exists():
+                logger.success(f"✅ {version} 可用: {target_dir}")
+            else:
+                logger.success(f"✅ {version} 提取成功: {target_dir}")
             processed_versions.append(version)
         else:
-            logger.error(f"❌ 离线解密失败: {latest_app.name}")
-        # 不再直接 return，继续执行到后面的 summary 保存逻辑
-    # ========== 核心改动结束 ==========
-    else:
-        print("\n" + "更新信息汇总".center(60,"="))
-        for info in all_infos: print_update_info(info)
-        processed_versions = []
-        for info in all_infos:
-            main_pkg = info.get("主更新包")
-            if not main_pkg: continue
-            opt_path = check_and_download_opt(main_pkg, opt_dir, info["允许下载时间"])
-            if not opt_path or not opt_path.exists(): continue
-            version = extract_version_from_desc(info["更新描述"], opt_path.name)
-            logger.info(f"版本标识: {version}")
-            if run_fsdecrypt(opt_path, version):
-                target_dir = opt_dir / version
-                if target_dir.exists():
-                    logger.success(f"✅ {version} 可用: {target_dir}")
-                else:
-                    logger.success(f"✅ {version} 提取成功: {target_dir}")
-                processed_versions.append(version)
-            else:
-                logger.error(f"❌ {version} 解密失败")
-    
+            logger.error(f"❌ {version} 解密失败")
     summary = {
         "获取时间": datetime.now().isoformat(),
         "处理的更新包": processed_versions,
