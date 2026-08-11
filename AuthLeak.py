@@ -162,9 +162,14 @@ def auth_lite_encrypt(plaintext: str) -> bytes:
     return cipher.encrypt(padded)
 
 def auth_lite_decrypt(ciphertext: bytes) -> str:
-    cipher = AES.new(LITE_AUTH_KEY, AES.MODE_CBC, LITE_AUTH_IV)
-    decrypted = unpad(cipher.decrypt(ciphertext), AES.block_size)
-    return decrypted[16:].decode("utf-8").strip()
+    # 服务器响应格式为 [16字节随机IV][AES密文]，旧格式为无 IV 纯密文（兼容保留）
+    if len(ciphertext) >= 32:
+        iv, data = ciphertext[:16], ciphertext[16:]
+    else:
+        iv, data = LITE_AUTH_IV, ciphertext
+    cipher = AES.new(LITE_AUTH_KEY, AES.MODE_CBC, iv)
+    decrypted = unpad(cipher.decrypt(data), AES.block_size)
+    return decrypted.decode("utf-8").strip()
 
 def create_session() -> requests.Session:
     session = requests.Session()
@@ -174,8 +179,8 @@ def create_session() -> requests.Session:
 def get_raw_delivery(serial: str) -> str:
     encrypted = auth_lite_encrypt(f"title_id={GAME_ID}&title_ver={TITLE_VER}&client_id={serial}")
     session = create_session()
-    session.mount("http://", NoCompressionAdapter())
-    resp = session.post("http://at.sys-allnet.cn/net/delivery/instruction", data=encrypted, headers=DELIVERY_HEADERS, timeout=REQUEST_TIMEOUT)
+    session.mount("https://", NoCompressionAdapter())
+    resp = session.post("https://at.sys-allnet.cn/net/delivery/instruction", data=encrypted, headers=DELIVERY_HEADERS, timeout=REQUEST_TIMEOUT)
     decrypted = auth_lite_decrypt(resp.content)
     return "".join(c for c in decrypted if 31 < ord(c) < 127)
 
@@ -184,7 +189,8 @@ def parse_raw_delivery(delivery_str: str) -> List[str]:
     if parsed.get("result") != "1": return []
     uri_str = parsed.get("uri", "")
     urls = [url for url in uri_str.split("|") if url and url != "null"]
-    return [url for url in urls if url.startswith("https://") and url.endswith(".txt")]
+    # 指示书文件后缀不固定（早期 .txt，现为 .info），仅校验 https 链接
+    return [url for url in urls if url.startswith("https://")]
 
 def get_update_ini(url: str) -> str:
     session = create_session()
